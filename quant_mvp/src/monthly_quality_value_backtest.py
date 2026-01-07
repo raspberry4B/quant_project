@@ -28,15 +28,22 @@ WAREHOUSE_PRICE_DIR = "data/warehouse/prices/qfq"
 
 # ========== 数据获取：交易日与ETF价格（用于总风控） ==========
 def fetch_etf_daily(symbol: str, start: str, end: str, adjust: str = "qfq") -> pd.DataFrame:
-    df = ak.fund_etf_hist_em(symbol=symbol, period="daily", start_date=start, end_date=end, adjust=adjust)
-    # 标准化
-    df = df.rename(columns={"日期": "date", "开盘": "open", "最高": "high", "最低": "low", "收盘": "close", "成交量": "volume"})
-    df["date"] = pd.to_datetime(df["date"])
+    p = Path("data/warehouse/prices") / adjust / f"{symbol}.csv"
+    if not p.exists():
+        raise FileNotFoundError(f"ETF file not found: {p.resolve()}")
+
+    df = pd.read_csv(p, parse_dates=["date"], encoding="utf-8-sig")
     df = df.sort_values("date").set_index("date")
+
+    # 统一列名并确保都是数值
     for c in ["open", "high", "low", "close", "volume"]:
         df[c] = pd.to_numeric(df[c], errors="coerce")
     df = df.dropna(subset=["close"])
-    return df[["open", "high", "low", "close", "volume"]]
+
+    # 用时间戳切片，start/end 是 YYYYMMDD
+    start_dt = pd.to_datetime(start)
+    end_dt = pd.to_datetime(end)
+    return df.loc[(df.index >= start_dt) & (df.index <= end_dt), ["open", "high", "low", "close", "volume"]]
 
 
 def month_first_trade_days(trading_index: pd.DatetimeIndex) -> List[pd.Timestamp]:
@@ -49,21 +56,18 @@ def month_first_trade_days(trading_index: pd.DatetimeIndex) -> List[pd.Timestamp
 
 # ========== 股票池（建议先用沪深300成分，减少数据量） ==========
 def get_stock_pool(trade_date: pd.Timestamp) -> List[str]:
-    if POOL_MODE == "custom":
-        return CUSTOM_POOL
-
-    # 沪深300成分（成分会随时间变化；阶段一先用“当期成分”近似）
-    # 注意：该接口返回的代码格式可能带市场前缀或不同字段名，你需要按实际返回做一次映射
-    cons = ak.index_stock_cons(symbol="000300")  # 沪深300
-    # 常见字段：成分券代码
-    code_col = None
-    for c in ["con_code", "成分券代码", "品种代码", "代码"]:
-        if c in cons.columns:
-            code_col = c
-            break
-    if code_col is None:
-        raise ValueError(f"Cannot find code column in hs300 constituents. got={list(cons.columns)}")
-    codes = cons[code_col].astype(str).str.zfill(6).tolist()
+    # 离线：直接用本地价格仓库文件名作为股票池
+    p = Path("data/warehouse/prices") / ADJUST
+    codes = []
+    for f in p.glob("*.csv"):
+        code = f.stem
+        # 跳过 ETF
+        if code == "510300":
+            continue
+        # 只保留 A 股 6 位代码
+        if len(code) == 6 and code.isdigit():
+            codes.append(code)
+    codes.sort()
     return codes
 
 
@@ -76,122 +80,57 @@ def fetch_spot_snapshot() -> pd.DataFrame:
     df = ak.stock_zh_a_spot_em()
     return df
 
-
+#目前测试财务接口都挂了
 def fetch_financial_indicators(code: str) -> pd.DataFrame:
     """
     财务分析指标（通常含 ROE、净利润等）。
     不同接口字段会有差异；这里以“先拉到数据”为目标，后续你再精细化字段选择。
     """
-    df = ak.stock_financial_analysis_indicator(symbol=code)
+    #df = ak.stock_financial_analysis_indicator(symbol=code)
+    df = ak.stock_financial_analysis_indicator_em(symbol=code)
     return df
 
 
-# ========== 选股逻辑（横截面） ==========
+# 策略定义（PB + PE + 市值 + 非ST）
 def select_stocks(trade_date: pd.Timestamp) -> List[str]:
-    # 1) 股票池
     pool = get_stock_pool(trade_date)
 
-    # 2) 快照：估值/市值/名称（用于ST近似过滤）
     spot = fetch_spot_snapshot().copy()
 
-    # 尝试识别关键列
-    def find_col(cands: List[str]) -> str:
-        for c in cands:
-            if c in spot.columns:
-                return c
-        raise ValueError(f"Cannot find columns {cands}. got={list(spot.columns)}")
+    # 固定字段（来自你的 spot.columns 打印）
+    col_code = "代码"
+    col_name = "名称"
+    col_mcap = "流通市值"
+    col_pb = "市净率"
+    col_pe = "市盈率-动态"
 
-    col_code = find_col(["代码", "code", "股票代码"])
-    col_name = find_col(["名称", "name", "股票简称"])
-    # 市值/估值字段在不同版本可能叫法不同，这里给候选
-    col_mcap = None
-    for c in ["流通市值", "流通市值(元)", "流通市值（元）", "流通市值(亿)", "流通市值（亿）"]:
-        if c in spot.columns:
-            col_mcap = c
-            break
-    col_pb = None
-    for c in ["市净率", "市净率PB", "PB", "PB(市净率)"]:
-        if c in spot.columns:
-            col_pb = c
-            break
-    if col_mcap is None or col_pb is None:
-        raise ValueError(f"Cannot find mcap/pb columns. got={list(spot.columns)}")
-
-    snap = spot[[col_code, col_name, col_mcap, col_pb]].copy()
+    snap = spot[[col_code, col_name, col_mcap, col_pb, col_pe]].copy()
     snap[col_code] = snap[col_code].astype(str).str.zfill(6)
 
-    # 3) pool 过滤
+    # 1) 股票池过滤
     snap = snap[snap[col_code].isin(pool)]
 
-    # 4) ST 近似过滤（严格做法后续可替换为专门ST列表）
+    # 2) ST过滤（近似）
     snap = snap[~snap[col_name].astype(str).str.contains("ST")]
 
-    # 5) 市值/估值过滤（注意单位：有的字段是“亿”，有的是“元”）
-    mcap = pd.to_numeric(snap[col_mcap], errors="coerce")
-    pb = pd.to_numeric(snap[col_pb], errors="coerce")
+    # 3) 数值化
+    snap["mcap"] = pd.to_numeric(snap[col_mcap], errors="coerce")  # 你的日志表明是“元”
+    snap["pb"] = pd.to_numeric(snap[col_pb], errors="coerce")
+    snap["pe"] = pd.to_numeric(snap[col_pe], errors="coerce")
 
-    # 单位处理：若看起来像“亿”，转成元
-    # 经验规则：若中位数 < 1e6，通常是“亿”为单位（例如 1234.56 亿）
-    med = mcap.median(skipna=True)
-    if pd.notna(med) and med < 1e6:
-        mcap = mcap * 1e8
-    
-    print("mcap median:", mcap.median())
-    print("mcap min/max:", mcap.min(), mcap.max())
+    snap = snap.dropna(subset=["mcap", "pb", "pe"])
 
-    snap = snap.assign(mcap=mcap, pb=pb).dropna(subset=["mcap", "pb"])
+    # 4) 过滤：市值/估值
     snap = snap[(snap["mcap"] >= MCAP_MIN) & (snap["mcap"] <= MCAP_MAX)]
     snap = snap[snap["pb"] <= PB_MAX]
+    snap = snap[(snap["pe"] > 0) & (snap["pe"] <= 60)]
 
-    # 6) 财务过滤 + 排序（ROE）
-    records = []
-    for code in snap[col_code].tolist():
-        try:
-            fin = fetch_financial_indicators(code)
-            if fin is None or len(fin) == 0:
-                continue
+    # 5) 排序 + 取前N
+    snap = snap.sort_values(["pb", "pe"], ascending=[True, True])
+    picks = snap.head(N_HOLD)[col_code].tolist()
 
-            # 尝试找到 ROE、净利润字段（候选）
-            def find_fin_col(df, cands):
-                for c in cands:
-                    if c in df.columns:
-                        return c
-                return None
+    return picks
 
-            roe_col = find_fin_col(fin, ["净资产收益率(ROE)", "净资产收益率", "ROE", "ROE(%)"])
-            profit_col = find_fin_col(fin, ["净利润", "归母净利润", "净利润(元)", "归母净利润(元)"])
-
-            if roe_col is None or profit_col is None:
-                print(f"[MISS] {code} no ROE col, fin cols={list(fin.columns)}")
-                continue
-
-            # 取最新一期（通常第一行就是最新；保险起见按报告期排序）
-            fin2 = fin.copy()
-            # 常见报告期字段候选
-            rpt_col = find_fin_col(fin2, ["报告期", "日期", "截止日期", "period"])
-            if rpt_col is not None:
-                fin2[rpt_col] = pd.to_datetime(fin2[rpt_col], errors="coerce")
-                fin2 = fin2.sort_values(rpt_col, ascending=False)
-
-            roe = pd.to_numeric(fin2.iloc[0][roe_col], errors="coerce")
-            profit = pd.to_numeric(fin2.iloc[0][profit_col], errors="coerce")
-
-            if pd.isna(roe) or pd.isna(profit):
-                continue
-            if roe < ROE_MIN:
-                continue
-            if profit <= 0:
-                continue
-
-            records.append((code, float(roe)))
-        except Exception:
-            continue
-
-    if not records:
-        return []
-
-    sel = pd.DataFrame(records, columns=["code", "roe"]).sort_values("roe", ascending=False)
-    return sel.head(N_HOLD)["code"].tolist()
 
 
 # ========== 回测：月频调仓、等权、趋势过滤 ==========
@@ -275,22 +214,11 @@ def backtest_monthly():
 
     rebalance_days = month_first_trade_days(etf.index)
     rebalance_days = [d for d in rebalance_days if pd.notna(etf.loc[d, "ma"])]
+    print("[INFO] first rebalance day:", rebalance_days[0].date(), "last:", rebalance_days[-1].date(), "count:", len(rebalance_days))
 
     price_cache: Dict[str, pd.DataFrame] = {}
-
-    # 在线获取股票价格数据的辅助函数
-    '''def get_stock_price_df(code: str) -> pd.DataFrame:
-        if code in price_cache:
-            return price_cache[code]
-        df = ak.stock_zh_a_hist(symbol=code, period="daily", start_date=START, end_date=END, adjust="qfq")
-        df = df.rename(columns={"日期": "date", "收盘": "close"})
-        df["date"] = pd.to_datetime(df["date"])
-        df = df.sort_values("date").set_index("date")
-        df["close"] = pd.to_numeric(df["close"], errors="coerce")
-        df = df.dropna(subset=["close"])
-        price_cache[code] = df[["close"]]
-        return price_cache[code]'''
     
+    # 使用本地缓存的价格数据
     def get_stock_price_df(code: str) -> pd.DataFrame:
         if code in price_cache:
             return price_cache[code]
@@ -317,7 +245,9 @@ def backtest_monthly():
             continue
 
         picks = select_stocks(d0)
-        print(f"[REB] {d0.date()} picks={len(picks)}")
+        print(f"[REB] {d0.date()} picks={len(picks)} risk_off={risk_off}")
+        if len(picks) > 0:
+            print("   sample:", picks[:5])
 
         if not picks:
             out.append((d0, nav))
