@@ -7,7 +7,7 @@ from typing import List, Dict, Tuple
 
 import pandas as pd
 import akshare as ak
-
+import numpy as np
 
 # ========== 参数区（你可直接改这里） ==========
 ETF_SYMBOL = "510300"              # 用于总风控
@@ -25,6 +25,7 @@ MIN_CASH_BUFFER = 0.02             # 现金缓冲（用于实盘 sizing；回测
 POOL_MODE = "hs300"                # "hs300" 或 "custom"
 CUSTOM_POOL = ["600519", "000001"] # 仅当 POOL_MODE="custom" 时使用（示例）
 WAREHOUSE_PRICE_DIR = "data/warehouse/prices/qfq"
+PRICE_DIR = Path("data/warehouse/prices") / ADJUST
 
 # ========== 数据获取：交易日与ETF价格（用于总风控） ==========
 def fetch_etf_daily(symbol: str, start: str, end: str, adjust: str = "qfq") -> pd.DataFrame:
@@ -94,42 +95,76 @@ def fetch_financial_indicators(code: str) -> pd.DataFrame:
 # 策略定义（PB + PE + 市值 + 非ST）
 def select_stocks(trade_date: pd.Timestamp) -> List[str]:
     pool = get_stock_pool(trade_date)
+    picks = []
 
-    spot = fetch_spot_snapshot().copy()
+    records = []
+    for code in pool:
+        p = PRICE_DIR / f"{code}.csv"
+        if not p.exists():
+            continue
 
-    # 固定字段（来自你的 spot.columns 打印）
-    col_code = "代码"
-    col_name = "名称"
-    col_mcap = "流通市值"
-    col_pb = "市净率"
-    col_pe = "市盈率-动态"
+        df = pd.read_csv(p, parse_dates=["date"], encoding="utf-8-sig")
+        df = df.sort_values("date").set_index("date")
+        if "close" not in df.columns:
+            continue
+        df["close"] = pd.to_numeric(df["close"], errors="coerce")
+        if "volume" in df.columns:
+            df["volume"] = pd.to_numeric(df["volume"], errors="coerce")
+        df = df.dropna(subset=["close"])
 
-    snap = spot[[col_code, col_name, col_mcap, col_pb, col_pe]].copy()
-    snap[col_code] = snap[col_code].astype(str).str.zfill(6)
+        # 找到 trade_date 对应的可交易日位置（取不晚于 trade_date 的最后一个交易日）
+        idx = df.index.searchsorted(trade_date, side="right") - 1
+        if idx < 200:  # 至少需要 200 个交易日用于因子
+            continue
 
-    # 1) 股票池过滤
-    snap = snap[snap[col_code].isin(pool)]
+        close = df["close"].iloc[: idx + 1]
+        volu = df["volume"].iloc[: idx + 1] if "volume" in df.columns else None
 
-    # 2) ST过滤（近似）
-    snap = snap[~snap[col_name].astype(str).str.contains("ST")]
+        # 因子窗口（交易日）
+        # mom: (t-20)/(t-140) - 1 约 6个月动量，跳过近20日
+        c_t = close.iloc[-1]
+        c_20 = close.iloc[-21]
+        c_140 = close.iloc[-141]
+        if c_140 <= 0 or c_20 <= 0:
+            continue
 
-    # 3) 数值化
-    snap["mcap"] = pd.to_numeric(snap[col_mcap], errors="coerce")  # 你的日志表明是“元”
-    snap["pb"] = pd.to_numeric(snap[col_pb], errors="coerce")
-    snap["pe"] = pd.to_numeric(snap[col_pe], errors="coerce")
+        mom = c_20 / c_140 - 1.0
+        ret20 = c_t / c_20 - 1.0
 
-    snap = snap.dropna(subset=["mcap", "pb", "pe"])
+        # 波动率：60日收益标准差
+        r = close.pct_change().dropna()
+        r = r.replace([np.inf, -np.inf], np.nan).dropna()
+        if len(r) < 70:
+            continue
+        vol60 = r.iloc[-60:].std()
 
-    # 4) 过滤：市值/估值
-    snap = snap[(snap["mcap"] >= MCAP_MIN) & (snap["mcap"] <= MCAP_MAX)]
-    snap = snap[snap["pb"] <= PB_MAX]
-    snap = snap[(snap["pe"] > 0) & (snap["pe"] <= 60)]
+        # 流动性过滤：20日平均成交量（代理）
+        liq20 = None
+        if volu is not None and len(volu.dropna()) >= 30:
+            liq20 = volu.iloc[-20:].mean()
 
-    # 5) 排序 + 取前N
-    snap = snap.sort_values(["pb", "pe"], ascending=[True, True])
-    picks = snap.head(N_HOLD)[col_code].tolist()
+        records.append((code, mom, ret20, vol60, liq20))
 
-    return picks
+    if not records:
+        return []
+
+    fac = pd.DataFrame(records, columns=["code", "mom", "ret20", "vol60", "liq20"])
+
+    # 过滤：短期不能太差
+    fac = fac[fac["ret20"] > -0.15]
+
+    # 流动性过滤（如果有）
+    if fac["liq20"].notna().any():
+        thr = fac["liq20"].quantile(0.2)
+        fac = fac[fac["liq20"] >= thr]
+
+    # 去掉极端高波动（可选）
+    fac = fac[fac["vol60"] <= fac["vol60"].quantile(0.7)]
+
+    # 排序：动量优先，波动率次之
+    fac = fac.sort_values(["mom", "vol60"], ascending=[False, True])
+
+    return fac.head(N_HOLD)["code"].tolist()
 
 
 
